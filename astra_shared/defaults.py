@@ -16,6 +16,9 @@ from pathlib import Path
 
 DEFAULT_EIRP_DBW: float = 70.0
 DEFAULT_RX_GAIN_DBI: float = 0.0
+DEFAULT_SYSTEM_NOISE_TEMP_K: float = 290.0
+BOLTZMANN_DB: float = 228.6
+K_BOLTZMANN_LINEAR: float = 1.380649e-23
 
 # =============================================================================
 # ITU-R P.618 Atmospheric Model Defaults

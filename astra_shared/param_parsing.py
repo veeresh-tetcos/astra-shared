@@ -1,14 +1,17 @@
 """Shared RF parameter parsing helpers used by all Astra services."""
 
 import json
+import logging
 import math
 
-from .defaults import DEFAULT_EIRP_DBW, DEFAULT_RX_GAIN_DBI, VALID_CLUTTER_CLASS_IDS
+from .defaults import (
+    DEFAULT_EIRP_DBW,
+    DEFAULT_RX_GAIN_DBI,
+    DEFAULT_SYSTEM_NOISE_TEMP_K,
+    VALID_CLUTTER_CLASS_IDS,
+)
 
-
-# =============================================================================
-# Generic Parsing Helpers
-# =============================================================================
+logger = logging.getLogger(__name__)
 
 
 def _get_float(
@@ -19,8 +22,11 @@ def _get_float(
     max_val: float | None = None,
 ) -> float:
     """Parse a float parameter with optional clamping."""
+    raw_value = params.get(key, default)
+    if raw_value in (None, ""):
+        raw_value = default
     try:
-        value = float(params.get(key, default) or default)
+        value = float(raw_value)
     except (TypeError, ValueError):
         value = default
     if min_val is not None:
@@ -38,8 +44,11 @@ def _get_int(
     max_val: int | None = None,
 ) -> int:
     """Parse an integer parameter with optional clamping."""
+    raw_value = params.get(key, default)
+    if raw_value in (None, ""):
+        raw_value = default
     try:
-        value = int(float(params.get(key, default) or default))
+        value = int(float(raw_value))
     except (TypeError, ValueError):
         value = default
     if min_val is not None:
@@ -51,7 +60,10 @@ def _get_int(
 
 def _get_str(params: dict, key: str, default: str) -> str:
     """Parse a string parameter."""
-    return str(params.get(key, default) or default).strip()
+    raw_value = params.get(key, default)
+    if raw_value is None:
+        raw_value = default
+    return str(raw_value).strip()
 
 
 def _parse_clutter_values(params: dict) -> dict[int, float] | None:
@@ -92,7 +104,7 @@ def _parse_clutter_values(params: dict) -> dict[int, float] | None:
 
 
 def _parse_clutter_fallback(params: dict) -> float | None:
-    """Parse user-supplied clutter fallback value (dB), clamped to 0–30."""
+    """Parse user-supplied clutter fallback value (dB), clamped to 0-30."""
     raw = params.get("clutter_fallback")
     if raw is None or raw == "" or raw == "null":
         return None
@@ -139,7 +151,7 @@ def parse_rf_params(params: dict) -> dict:
     """Parse RF parameters from any source into a canonical dict.
 
     Accepts form args, config.json, project files, or HTTP request bodies.
-    Callers use the subset they need — unused keys are harmless.
+    Callers use the subset they need � unused keys are harmless.
     """
     freq_ghz = _get_float(
         params, "frequency_ghz", _get_float(params, "frequency", 12.0), min_val=0.001
@@ -148,6 +160,29 @@ def parse_rf_params(params: dict) -> dict:
     aperture_radius_wl = _get_float(params, "aperture_radius_wl", 10.0, min_val=1.0)
     wavelength_m = 3.0e8 / freq_hz
     aperture_radius_m = aperture_radius_wl * wavelength_m
+    system_noise_temp_k = _get_float(
+        params,
+        "system_noise_temp_k",
+        DEFAULT_SYSTEM_NOISE_TEMP_K,
+        min_val=10.0,
+        max_val=10000.0,
+    )
+
+    bw_raw = params.get("bandwidth_hz")
+    try:
+        bandwidth_hz = float(bw_raw) if bw_raw not in (None, "", "null") else None
+    except (TypeError, ValueError):
+        bandwidth_hz = None
+
+    if bandwidth_hz is not None and bandwidth_hz <= 0:
+        bandwidth_hz = None
+
+    logger.debug(
+        "[RF] noise_temp_k=%s bandwidth_hz=%s cn_enabled=%s",
+        system_noise_temp_k,
+        bandwidth_hz,
+        bandwidth_hz is not None,
+    )
 
     return {
         "eirp_dbw":            _parse_eirp(params),
@@ -171,4 +206,6 @@ def parse_rf_params(params: dict) -> dict:
         "availability_percent": _get_float(params, "availability_percent", 99.0, min_val=90.0, max_val=99.999),
         "additional_losses_db": _get_float(params, "additional_losses_db", 2.0, min_val=0.0, max_val=20.0),
         "polarization_loss_db": _get_float(params, "polarization_loss_db", 0.0, min_val=0.0, max_val=10.0),
+        "system_noise_temp_k": system_noise_temp_k,
+        "bandwidth_hz": bandwidth_hz,
     }
