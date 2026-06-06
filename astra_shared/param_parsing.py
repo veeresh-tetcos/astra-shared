@@ -5,9 +5,16 @@ import logging
 import math
 
 from .defaults import (
+    ADDITIONAL_LOSSES_DB_MAX,
+    ADDITIONAL_LOSSES_DB_MIN,
+    CLUTTER_LOSS_DB_MAX,
+    CLUTTER_LOSS_DB_MIN,
+    DEFAULT_BANDWIDTH_HZ,
     DEFAULT_EIRP_DBW,
     DEFAULT_RX_GAIN_DBI,
     DEFAULT_SYSTEM_NOISE_TEMP_K,
+    POLARIZATION_LOSS_DB_MAX,
+    POLARIZATION_LOSS_DB_MIN,
     VALID_CLUTTER_CLASS_IDS,
 )
 
@@ -98,13 +105,13 @@ def _parse_clutter_values(params: dict) -> dict[int, float] | None:
             continue
         if not math.isfinite(fval):
             continue
-        result[class_id] = max(0.0, min(30.0, fval))
+        result[class_id] = max(CLUTTER_LOSS_DB_MIN, min(CLUTTER_LOSS_DB_MAX, fval))
 
     return result if result else None
 
 
 def _parse_clutter_fallback(params: dict) -> float | None:
-    """Parse user-supplied clutter fallback value (dB), clamped to 0-30."""
+    """Parse user-supplied clutter fallback value (dB), clamped to CLUTTER_LOSS_DB_MIN..MAX."""
     raw = params.get("clutter_fallback")
     if raw is None or raw == "" or raw == "null":
         return None
@@ -114,7 +121,7 @@ def _parse_clutter_fallback(params: dict) -> float | None:
         return None
     if not math.isfinite(val):
         return None
-    return max(0.0, min(30.0, val))
+    return max(CLUTTER_LOSS_DB_MIN, min(CLUTTER_LOSS_DB_MAX, val))
 
 
 def _parse_clutter_enable(params: dict) -> bool:
@@ -168,14 +175,28 @@ def parse_rf_params(params: dict) -> dict:
         max_val=10000.0,
     )
 
-    bw_raw = params.get("bandwidth_hz")
-    try:
-        bandwidth_hz = float(bw_raw) if bw_raw not in (None, "", "null") else None
-    except (TypeError, ValueError):
-        bandwidth_hz = None
+    bw_mhz_raw = params.get("bandwidth_mhz")
+    bw_hz_raw = params.get("bandwidth_hz")
+    bandwidth_hz = None
+    explicit_bw = False
+    if bw_mhz_raw not in (None, "", "null"):
+        explicit_bw = True
+        try:
+            bandwidth_hz = float(bw_mhz_raw) * 1e6
+        except (TypeError, ValueError):
+            bandwidth_hz = None
+    elif bw_hz_raw not in (None, "", "null"):
+        explicit_bw = True
+        try:
+            bandwidth_hz = float(bw_hz_raw)
+        except (TypeError, ValueError):
+            bandwidth_hz = None
 
     if bandwidth_hz is not None and bandwidth_hz <= 0:
         bandwidth_hz = None
+
+    if bandwidth_hz is None and not explicit_bw:
+        bandwidth_hz = DEFAULT_BANDWIDTH_HZ
 
     logger.debug(
         "[RF] noise_temp_k=%s bandwidth_hz=%s cn_enabled=%s",
@@ -204,8 +225,12 @@ def parse_rf_params(params: dict) -> dict:
         "clutter_fallback":    _parse_clutter_fallback(params),
         "atmospheric_mode":    _get_str(params, "atmospheric_mode", "disable").lower(),
         "availability_percent": _get_float(params, "availability_percent", 99.0, min_val=90.0, max_val=99.999),
-        "additional_losses_db": _get_float(params, "additional_losses_db", 2.0, min_val=0.0, max_val=20.0),
-        "polarization_loss_db": _get_float(params, "polarization_loss_db", 0.0, min_val=0.0, max_val=10.0),
+        "additional_losses_db": _get_float(
+            params, "additional_losses_db", 2.0, min_val=ADDITIONAL_LOSSES_DB_MIN, max_val=ADDITIONAL_LOSSES_DB_MAX
+        ),
+        "polarization_loss_db": _get_float(
+            params, "polarization_loss_db", 0.0, min_val=POLARIZATION_LOSS_DB_MIN, max_val=POLARIZATION_LOSS_DB_MAX
+        ),
         "system_noise_temp_k": system_noise_temp_k,
         "bandwidth_hz": bandwidth_hz,
     }
