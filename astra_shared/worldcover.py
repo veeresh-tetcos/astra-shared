@@ -535,11 +535,13 @@ def clutter_loss_db(
 
     cl = fetch_worldcover_class(lat, lon, worldcover_dir)
     if cl is None:
-        val = fb
-    else:
-        if verbose and (point_num == 0 or point_num % 50 == 0):
-            print(f"[Clutter] WorldCover class at lat={lat:.2f}, lon={lon:.2f} is {cl}")
-        val = table.get(cl, fb)
+        # Tile unavailable (download failed, ocean, bbox-skipped) — return fallback
+        # but do NOT cache it so a later successful download gives the real value.
+        return fb
+
+    if verbose and (point_num == 0 or point_num % 50 == 0):
+        print(f"[Clutter] WorldCover class at lat={lat:.2f}, lon={lon:.2f} is {cl}")
+    val = table.get(cl, fb)
 
     with _CLUTTER_CACHE_LOCK:
         _CLUTTER_CACHE[key] = val
