@@ -385,6 +385,13 @@ def fetch_worldcover_class(
     tile_name = get_tile_name(lat, lon)
     tile_path = worldcover_dir / tile_name
 
+    # Support setups where tiles are stored in a `worldcover/` subdirectory
+    if not tile_path.exists():
+        alt_dir = worldcover_dir / "worldcover"
+        alt_path = alt_dir / tile_name
+        if alt_path.exists():
+            tile_path = alt_path
+
     if not tile_path.exists():
         if not download_if_missing:
             return None
