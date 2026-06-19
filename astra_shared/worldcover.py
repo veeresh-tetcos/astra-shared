@@ -10,8 +10,11 @@ to compute clutter loss for satellite link budget calculations.
 
 from __future__ import annotations
 
+import collections
 import json
+import logging
 import math
+import os
 import platform
 import threading
 import time
@@ -37,8 +40,53 @@ try:
 except ImportError:
     HAS_RASTERIO = False
 
-# Module-level cache for clutter loss values
-_CLUTTER_CACHE: dict[tuple[int, int], float] = {}
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Bounded LRU clutter cache
+# Stays between CLUTTER_CACHE_MIN_SIZE and CLUTTER_CACHE_MAX_SIZE entries.
+# A background daemon thread evicts the oldest (LRU) entries whenever the
+# cache exceeds the max, trimming it back down to the min.
+# Configurable via environment variables.
+# ---------------------------------------------------------------------------
+_CACHE_MIN_SIZE: int = int(
+    os.environ.get("CLUTTER_CACHE_MIN_SIZE", "4688828")
+)  # ~1.0 GB
+_CACHE_MAX_SIZE: int = int(
+    os.environ.get("CLUTTER_CACHE_MAX_SIZE", "7033243")
+)  # ~1.5 GB
+_CACHE_EVICT_INTERVAL: float = float(
+    os.environ.get("CLUTTER_CACHE_EVICT_INTERVAL", "60")
+)
+
+# OrderedDict gives O(1) LRU via move_to_end / popitem(last=False)
+_CLUTTER_CACHE: collections.OrderedDict[tuple[int, int], float] = (
+    collections.OrderedDict()
+)
+_CLUTTER_CACHE_LOCK = threading.Lock()
+
+
+def _evict_clutter_cache() -> int:
+    """Evict oldest entries until cache is at min size. Returns number evicted."""
+    evicted = 0
+    with _CLUTTER_CACHE_LOCK:
+        while len(_CLUTTER_CACHE) > _CACHE_MIN_SIZE:
+            _CLUTTER_CACHE.popitem(last=False)
+            evicted += 1
+    return evicted
+
+
+def _clutter_cache_eviction_loop() -> None:
+    """Background daemon: evict stale entries when cache exceeds max size."""
+    while True:
+        time.sleep(_CACHE_EVICT_INTERVAL)
+        if len(_CLUTTER_CACHE) > _CACHE_MAX_SIZE:
+            _evict_clutter_cache()
+
+
+threading.Thread(
+    target=_clutter_cache_eviction_loop, daemon=True, name="clutter-cache-evictor"
+).start()
 
 # Tile dataset cache: {tile_name: (dataset, transformer, timestamp)}
 # Keeps rasterio file handles open for 10 minutes to avoid repeated file I/O
@@ -51,6 +99,11 @@ _CACHE_TTL_SECONDS = 600  # 10 minutes
 _TILE_CACHE_LOCK = threading.Lock()
 _TILE_REFS: dict[str, int] = {}  # Reference count per tile
 
+# Per-tile download locks: prevents two threads from downloading the same tile
+# simultaneously. Lock is acquired for the duration of the download only.
+_TILE_DOWNLOAD_LOCKS: dict[str, threading.Lock] = {}
+_TILE_DOWNLOAD_LOCKS_LOCK = threading.Lock()
+
 # Active bounding box for tile filtering optimization
 # Format: (min_lon, min_lat, max_lon, max_lat) or None
 _ACTIVE_BBOX: tuple[float, float, float, float] | None = None
@@ -58,7 +111,8 @@ _ACTIVE_BBOX: tuple[float, float, float, float] | None = None
 
 def clear_clutter_cache() -> None:
     """Clear the clutter loss cache."""
-    _CLUTTER_CACHE.clear()
+    with _CLUTTER_CACHE_LOCK:
+        _CLUTTER_CACHE.clear()
 
 
 def clear_tile_cache() -> None:
@@ -284,14 +338,15 @@ def ensure_worldcover_tile(
     """
     Ensure ESA WorldCover 3x3 degree tile exists locally.
 
-    Downloads the tile from S3 if not present. If an active bounding box is set,
-    tiles outside the bbox are skipped to optimize download.
+    Downloads the tile from S3 if not present. Per-tile locking prevents
+    concurrent threads from downloading the same tile simultaneously.
+    If an active bounding box is set, tiles outside the bbox are skipped.
 
     Args:
         lat: Latitude in degrees
         lon: Longitude in degrees
         worldcover_dir: Directory for storing WorldCover tiles
-        timeout_sec: Download timeout in seconds
+        timeout_sec: Total download timeout in seconds (default 300)
 
     Returns:
         Path to the local tile file, or None if tile is outside active bbox
@@ -299,14 +354,12 @@ def ensure_worldcover_tile(
     Raises:
         RuntimeError: If download fails or times out
     """
-    # Calculate tile coordinates (southwest corner)
     tile_lat = int(math.floor(lat / 3.0) * 3)
     tile_lon = int(math.floor(lon / 3.0) * 3)
 
-    # Check if tile is within active bounding box (optimization)
     if _ACTIVE_BBOX is not None:
         if not tile_overlaps_bbox(tile_lat, tile_lon, _ACTIVE_BBOX):
-            return None  # Skip this tile
+            return None
 
     tile_name = get_tile_name(lat, lon)
     tile_path = worldcover_dir / tile_name
@@ -314,51 +367,74 @@ def ensure_worldcover_tile(
     if tile_path.exists() and tile_path.stat().st_size > 0:
         return tile_path
 
-    import requests
+    # Per-tile lock: only one thread downloads a given tile at a time.
+    # Other threads block here and find the file ready when the lock is released.
+    with _TILE_DOWNLOAD_LOCKS_LOCK:
+        if tile_name not in _TILE_DOWNLOAD_LOCKS:
+            _TILE_DOWNLOAD_LOCKS[tile_name] = threading.Lock()
+        tile_lock = _TILE_DOWNLOAD_LOCKS[tile_name]
 
-    url = f"{WORLDCOVER_S3_BASE}/{tile_name}"
-    tmp_path = tile_path.with_suffix(".part")
-    start_time = time.time()
+    with tile_lock:
+        # Re-check after acquiring lock — another thread may have downloaded it
+        if tile_path.exists() and tile_path.stat().st_size > 0:
+            return tile_path
 
-    print(f"[WorldCover] Downloading {tile_name} from S3...")
-    try:
-        with requests.get(url, stream=True, timeout=30) as r:
-            if r.status_code == 404:
-                raise RuntimeError(
-                    f"WorldCover tile not found (HTTP 404) for {tile_name}"
-                )
-            if r.status_code != 200:
-                raise RuntimeError(
-                    f"WorldCover download failed (HTTP {r.status_code}) for {tile_name}"
-                )
-            total = int(r.headers.get("Content-Length", 0))
-            downloaded = 0
-            tile_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if time.time() - start_time > timeout_sec:
-                            raise RuntimeError(
-                                f"Download timed out after {timeout_sec}s"
-                            )
-            if total and downloaded < total:
-                raise RuntimeError(f"Incomplete download ({downloaded}/{total} bytes)")
-        tmp_path.replace(tile_path)
-        print(f"[WorldCover] Download complete: {tile_name}")
-        return tile_path
-    except Exception as exc:
-        if tmp_path.exists():
+        import requests
+
+        url = f"{WORLDCOVER_S3_BASE}/{tile_name}"
+        tmp_path = tile_path.with_suffix(".part")
+
+        # Create directory before opening the temp file
+        worldcover_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info("Downloading WorldCover tile %s from S3...", tile_name)
+        start_time = time.time()
+        try:
+            # connect_timeout=30, read_timeout=60 per chunk
+            with requests.get(url, stream=True, timeout=(30, 60)) as r:
+                if r.status_code == 404:
+                    raise RuntimeError(
+                        f"WorldCover tile not found on S3 (HTTP 404): {tile_name}"
+                    )
+                if r.status_code != 200:
+                    raise RuntimeError(
+                        f"WorldCover download failed (HTTP {r.status_code}): {tile_name}"
+                    )
+                total = int(r.headers.get("Content-Length", 0))
+                downloaded = 0
+                with open(tmp_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if time.time() - start_time > timeout_sec:
+                                raise RuntimeError(
+                                    f"Download timed out after {timeout_sec}s "
+                                    f"({downloaded} bytes received)"
+                                )
+                if total and downloaded < total:
+                    raise RuntimeError(
+                        f"Incomplete download: got {downloaded}/{total} bytes"
+                    )
+            tmp_path.replace(tile_path)
+            elapsed = time.time() - start_time
+            logger.info(
+                "WorldCover tile %s downloaded in %.1fs (%d bytes)",
+                tile_name,
+                elapsed,
+                downloaded,
+            )
+            return tile_path
+        except Exception as exc:
             tmp_path.unlink(missing_ok=True)
-        raise RuntimeError(f"Failed to download {tile_name}: {exc}") from exc
+            raise RuntimeError(f"Failed to download {tile_name}: {exc}") from exc
 
 
 def fetch_worldcover_class(
     lat: float,
     lon: float,
     worldcover_dir: Path | None = None,
-    download_if_missing: bool = False,
+    download_if_missing: bool = True,
 ) -> int | None:
     """
     Fetch ESA WorldCover land cover class from local tile.
@@ -396,9 +472,19 @@ def fetch_worldcover_class(
         if not download_if_missing:
             return None
         try:
-            tile_path = ensure_worldcover_tile(lat, lon, worldcover_dir)
-        except Exception:
+            result = ensure_worldcover_tile(lat, lon, worldcover_dir)
+        except Exception as exc:
+            logger.warning(
+                "WorldCover tile download failed for (%.4f, %.4f): %s — using fallback",
+                lat,
+                lon,
+                exc,
+            )
             return None
+        if result is None:
+            # Tile skipped (outside active bbox)
+            return None
+        tile_path = result
 
     try:
         # Use context manager for thread-safe tile access with reference counting
@@ -441,8 +527,11 @@ def clutter_loss_db(
         Clutter loss in dB
     """
     key = (int(round(lat * 1000)), int(round(lon * 1000)))
-    if key in _CLUTTER_CACHE:
-        return _CLUTTER_CACHE[key]
+
+    with _CLUTTER_CACHE_LOCK:
+        if key in _CLUTTER_CACHE:
+            _CLUTTER_CACHE.move_to_end(key)  # mark as recently used
+            return _CLUTTER_CACHE[key]
 
     table = loss_table if loss_table is not None else CLUTTER_LOSS_DB
     fb = fallback_db if fallback_db is not None else CLUTTER_FALLBACK_DB
@@ -453,15 +542,22 @@ def clutter_loss_db(
 
     cl = fetch_worldcover_class(lat, lon, worldcover_dir)
     if cl is None:
-        val = fb
-        _CLUTTER_CACHE[key] = val
-        return val
+        # Tile unavailable (download failed, ocean, bbox-skipped) — return fallback
+        # but do NOT cache it so a later successful download gives the real value.
+        return fb
 
     if verbose and (point_num == 0 or point_num % 50 == 0):
         print(f"[Clutter] WorldCover class at lat={lat:.2f}, lon={lon:.2f} is {cl}")
-
     val = table.get(cl, fb)
-    _CLUTTER_CACHE[key] = val
+
+    with _CLUTTER_CACHE_LOCK:
+        _CLUTTER_CACHE[key] = val
+        _CLUTTER_CACHE.move_to_end(key)
+        # Inline eviction: if we just crossed the max, trim to min immediately
+        if len(_CLUTTER_CACHE) > _CACHE_MAX_SIZE:
+            while len(_CLUTTER_CACHE) > _CACHE_MIN_SIZE:
+                _CLUTTER_CACHE.popitem(last=False)
+
     return val
 
 
