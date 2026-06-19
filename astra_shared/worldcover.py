@@ -46,8 +46,12 @@ except ImportError:
 # cache exceeds the max, trimming it back down to the min.
 # Configurable via environment variables.
 # ---------------------------------------------------------------------------
-_CACHE_MIN_SIZE: int = int(os.environ.get("CLUTTER_CACHE_MIN_SIZE", "5000"))
-_CACHE_MAX_SIZE: int = int(os.environ.get("CLUTTER_CACHE_MAX_SIZE", "20000"))
+_CACHE_MIN_SIZE: int = int(
+    os.environ.get("CLUTTER_CACHE_MIN_SIZE", "4688828")
+)  # ~1.0 GB
+_CACHE_MAX_SIZE: int = int(
+    os.environ.get("CLUTTER_CACHE_MAX_SIZE", "7033243")
+)  # ~1.5 GB
 _CACHE_EVICT_INTERVAL: float = float(
     os.environ.get("CLUTTER_CACHE_EVICT_INTERVAL", "60")
 )
