@@ -93,3 +93,14 @@ CLUTTER_CLASS_LABELS: dict[int, str] = {
 
 # Valid WorldCover class IDs — derived from CLUTTER_LOSS_DB, used for input validation
 VALID_CLUTTER_CLASS_IDS: frozenset[int] = frozenset(CLUTTER_LOSS_DB.keys())
+
+# =============================================================================
+# Flask Server Configuration
+# =============================================================================
+
+# Debug mode for Flask engines (radio, constellation).
+# False by default — debug mode enables the Werkzeug file-system reloader which
+# scans all Python files every ~2s, consuming 50%+ of engine CPU for nothing.
+# Enable via environment variable: ASTRA_DEBUG=1
+# Or change this constant directly for local development builds.
+FLASK_DEBUG_MODE: bool = os.environ.get("ASTRA_DEBUG", "0") == "1"

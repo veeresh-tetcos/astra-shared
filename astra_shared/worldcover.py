@@ -20,6 +20,8 @@ import threading
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
+
+import requests
 from pathlib import Path
 from typing import Callable
 
@@ -88,21 +90,79 @@ threading.Thread(
     target=_clutter_cache_eviction_loop, daemon=True, name="clutter-cache-evictor"
 ).start()
 
-# Tile dataset cache: {tile_name: (dataset, transformer, timestamp)}
-# Keeps rasterio file handles open for 10 minutes to avoid repeated file I/O
-_TILE_CACHE: dict[
-    str, tuple
-] = {}  # Type: Dict[str, Tuple[rasterio.DatasetReader, Transformer, float]]
+# Shared tile dataset cache: {tile_name: (dataset, transformer, timestamp)}
+# One DatasetReader per tile (minimal handles). Protected by _TILE_CACHE_LOCK for
+# open/close; protected by per-tile _TILE_READ_LOCKS for ds.read() calls.
+# rasterio DatasetReader.read() is NOT thread-safe — concurrent reads on the
+# same object corrupt GDAL's internal ZIP decoder. The per-tile read lock
+# serializes ds.read() calls so GDAL state is never touched by two threads at once.
+_TILE_CACHE: dict[str, tuple] = {}
 _CACHE_TTL_SECONDS = 600  # 10 minutes
-
-# Thread synchronization for tile cache access
 _TILE_CACHE_LOCK = threading.Lock()
-_TILE_REFS: dict[str, int] = {}  # Reference count per tile
+_TILE_REFS: dict[str, int] = {}          # ref-count: tile not evicted while > 0
+_TILE_READ_LOCKS: dict[str, threading.Lock] = {}  # per-tile read serialiser
 
 # Per-tile download locks: prevents two threads from downloading the same tile
 # simultaneously. Lock is acquired for the duration of the download only.
 _TILE_DOWNLOAD_LOCKS: dict[str, threading.Lock] = {}
 _TILE_DOWNLOAD_LOCKS_LOCK = threading.Lock()
+
+# Tiles confirmed absent on S3 (HTTP 404). Avoids re-requesting ocean tiles or
+# tiles outside the WorldCover coverage area on every coverage computation.
+# Persisted to WORLDCOVER_DIR/tiles_not_on_s3.json so ocean-tile probes are
+# skipped across service restarts (previously 51 wasted probes per Japan run).
+_TILES_NOT_ON_S3: set[str] = set()
+_TILES_NOT_ON_S3_PATH = WORLDCOVER_DIR / "tiles_not_on_s3.json"
+_TILES_NOT_ON_S3_LOCK = threading.Lock()
+
+
+def _load_tiles_not_on_s3() -> None:
+    try:
+        if _TILES_NOT_ON_S3_PATH.exists():
+            data = json.loads(_TILES_NOT_ON_S3_PATH.read_text())
+            if isinstance(data, list):
+                _TILES_NOT_ON_S3.update(data)
+                logger.debug("Loaded %d known-absent S3 tiles from cache", len(data))
+    except Exception as exc:
+        logger.warning("Could not load tiles_not_on_s3 cache: %s", exc)
+
+
+def _save_tiles_not_on_s3() -> None:
+    try:
+        tmp = _TILES_NOT_ON_S3_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(_TILES_NOT_ON_S3)))
+        tmp.replace(_TILES_NOT_ON_S3_PATH)
+    except Exception as exc:
+        logger.warning("Could not save tiles_not_on_s3 cache: %s", exc)
+
+# Tiles confirmed present on local disk.  Once a tile is in this set, the hot
+# path in fetch_worldcover_class skips the 337K pathlib.exists() syscalls
+# (each costs ~0.35 ms on Windows) that were the #1 bottleneck.
+_TILES_KNOWN_LOCAL: set[str] = set()
+
+# Bboxes that have already been fully prefetched this process lifetime.
+# Prevents the 30 parallel worker threads from each triggering a redundant prefetch.
+_PREFETCHED_BBOXES: set[tuple[float, float, float, float]] = set()
+_PREFETCHED_BBOXES_LOCK = threading.Lock()
+
+# Create WORLDCOVER_DIR once at import time (single-threaded) so no thread ever
+# needs to call mkdir during a live request — concurrent pathlib.mkdir on Windows
+# (Python 3.14) causes an access violation under heavy thread load.
+WORLDCOVER_DIR.mkdir(parents=True, exist_ok=True)
+_load_tiles_not_on_s3()
+
+# Persistent HTTPS session for S3 tile downloads.
+# Reusing one session across all downloads avoids per-connection TLS handshake
+# overhead (~0.5 s each): load_verify_locations + do_handshake + TCP connect
+# accounted for 42 s in a 213-tile download run.
+_S3_SESSION = requests.Session()
+_S3_ADAPTER = requests.adapters.HTTPAdapter(
+    pool_connections=4,
+    pool_maxsize=8,
+    max_retries=0,
+)
+_S3_SESSION.mount("https://", _S3_ADAPTER)
+_S3_SESSION.mount("http://", _S3_ADAPTER)
 
 # Active bounding box for tile filtering optimization
 # Format: (min_lon, min_lat, max_lon, max_lat) or None
@@ -116,21 +176,15 @@ def clear_clutter_cache() -> None:
 
 
 def clear_tile_cache() -> None:
-    """Close cached tile datasets with zero references."""
+    """Close cached tile datasets that have no active readers."""
     with _TILE_CACHE_LOCK:
-        to_remove = []
-        for tile_name, (ds, _, _) in list(_TILE_CACHE.items()):
+        for tile_name in list(_TILE_CACHE):
             if _TILE_REFS.get(tile_name, 0) == 0:
+                ds, _, _ = _TILE_CACHE.pop(tile_name)
                 try:
                     ds.close()
                 except Exception:
                     pass
-                to_remove.append(tile_name)
-        for tile_name in to_remove:
-            del _TILE_CACHE[tile_name]
-        # Small delay on Windows to ensure file handles are released
-        if to_remove and platform.system() == "Windows":
-            time.sleep(0.1)
 
 
 def set_active_bbox(bbox: tuple[float, float, float, float] | None) -> None:
@@ -231,85 +285,52 @@ def get_geojson_bounding_box(geojson: dict) -> tuple[float, float, float, float]
     return (min_lon, min_lat, max_lon, max_lat)
 
 
-def _get_cached_tile(tile_path: Path) -> tuple | None:
-    """Get cached tile dataset and transformer, or None if expired/missing."""
-    tile_name = tile_path.name
-    now = time.time()
-
-    if tile_name in _TILE_CACHE:
-        ds, transformer, timestamp = _TILE_CACHE[tile_name]
-        if now - timestamp < _CACHE_TTL_SECONDS:
-            return ds, transformer
-        # Expired - close and remove
-        try:
-            ds.close()
-        except Exception:
-            pass
-        del _TILE_CACHE[tile_name]
-    return None
-
-
-def _cache_tile(tile_path: Path) -> tuple:
-    """Open tile and cache dataset + transformer for reuse."""
-    ds = rasterio.open(tile_path)
-    transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
-    _TILE_CACHE[tile_path.name] = (ds, transformer, time.time())
-    return ds, transformer
-
-
-def _get_cached_tile_unlocked(tile_path: Path) -> tuple | None:
-    """Get cached tile without acquiring lock (caller must hold lock)."""
-    tile_name = tile_path.name
-    now = time.time()
-
-    if tile_name in _TILE_CACHE:
-        ds, transformer, timestamp = _TILE_CACHE[tile_name]
-        if now - timestamp < _CACHE_TTL_SECONDS:
-            return ds, transformer
-        # Expired but has references - keep it
-        if _TILE_REFS.get(tile_name, 0) > 0:
-            return ds, transformer
-        # Expired and no references - close it
-        try:
-            ds.close()
-        except Exception:
-            pass
-        del _TILE_CACHE[tile_name]
-    return None
-
-
-def _cache_tile_unlocked(tile_path: Path) -> tuple:
-    """Open tile and cache (caller must hold lock)."""
-    ds = rasterio.open(tile_path)
-    transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
-    _TILE_CACHE[tile_path.name] = (ds, transformer, time.time())
-    return ds, transformer
-
-
 @contextmanager
 def tile_reader(tile_path: Path) -> Generator[tuple, None, None]:
-    """Context manager for safe tile access with reference counting."""
+    """
+    Thread-safe tile access: one shared DatasetReader per tile, serialised reads.
+
+    Strategy:
+    - _TILE_CACHE holds one rasterio.DatasetReader per tile (minimises OS handles).
+    - _TILE_READ_LOCKS[tile] serialises ds.read() calls for that tile, because
+      rasterio/GDAL's internal ZIP decoder is NOT thread-safe for concurrent reads
+      on the same object.  Reads are microseconds, so lock contention is negligible.
+    - _TILE_REFS prevents eviction of a tile while any reader holds it.
+    """
     tile_name = tile_path.name
+    now = time.time()
 
     with _TILE_CACHE_LOCK:
-        # Get or create cached tile
-        cached = _get_cached_tile_unlocked(tile_path)
-        if cached:
-            ds, transformer = cached
+        entry = _TILE_CACHE.get(tile_name)
+        if entry:
+            ds, transformer, ts = entry
+            if now - ts >= _CACHE_TTL_SECONDS and _TILE_REFS.get(tile_name, 0) == 0:
+                # Expired and no active readers — reopen
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+                ds = rasterio.open(tile_path)
+                transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
+                _TILE_CACHE[tile_name] = (ds, transformer, now)
         else:
-            ds, transformer = _cache_tile_unlocked(tile_path)
+            ds = rasterio.open(tile_path)
+            transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
+            _TILE_CACHE[tile_name] = (ds, transformer, now)
 
-        # Increment reference count
         _TILE_REFS[tile_name] = _TILE_REFS.get(tile_name, 0) + 1
 
+        if tile_name not in _TILE_READ_LOCKS:
+            _TILE_READ_LOCKS[tile_name] = threading.Lock()
+        read_lock = _TILE_READ_LOCKS[tile_name]
+
+    read_lock.acquire()
     try:
         yield ds, transformer
     finally:
+        read_lock.release()
         with _TILE_CACHE_LOCK:
-            if tile_name in _TILE_REFS:
-                _TILE_REFS[tile_name] -= 1
-                if _TILE_REFS[tile_name] <= 0:
-                    del _TILE_REFS[tile_name]
+            _TILE_REFS[tile_name] = max(0, _TILE_REFS.get(tile_name, 1) - 1)
 
 
 def get_tile_name(lat: float, lon: float) -> str:
@@ -362,9 +383,15 @@ def ensure_worldcover_tile(
             return None
 
     tile_name = get_tile_name(lat, lon)
+
+    # Skip tiles confirmed absent on S3 (ocean tiles, tiles outside coverage area)
+    if tile_name in _TILES_NOT_ON_S3:
+        return None
+
     tile_path = worldcover_dir / tile_name
 
     if tile_path.exists() and tile_path.stat().st_size > 0:
+        _TILES_KNOWN_LOCAL.add(tile_name)
         return tile_path
 
     # Per-tile lock: only one thread downloads a given tile at a time.
@@ -376,10 +403,12 @@ def ensure_worldcover_tile(
 
     with tile_lock:
         # Re-check after acquiring lock — another thread may have downloaded it
+        # or confirmed it absent while we were waiting.
+        if tile_name in _TILES_NOT_ON_S3:
+            return None
         if tile_path.exists() and tile_path.stat().st_size > 0:
+            _TILES_KNOWN_LOCAL.add(tile_name)
             return tile_path
-
-        import requests
 
         url = f"{WORLDCOVER_S3_BASE}/{tile_name}"
         tmp_path = tile_path.with_suffix(".part")
@@ -391,11 +420,16 @@ def ensure_worldcover_tile(
         start_time = time.time()
         try:
             # connect_timeout=30, read_timeout=60 per chunk
-            with requests.get(url, stream=True, timeout=(30, 60)) as r:
+            with _S3_SESSION.get(url, stream=True, timeout=(30, 60)) as r:
                 if r.status_code == 404:
-                    raise RuntimeError(
-                        f"WorldCover tile not found on S3 (HTTP 404): {tile_name}"
-                    )
+                    # Tile doesn't exist on S3 (ocean or outside coverage area).
+                    # Record it so future calls skip the S3 round-trip entirely,
+                    # and persist so the skip survives service restarts.
+                    with _TILES_NOT_ON_S3_LOCK:
+                        _TILES_NOT_ON_S3.add(tile_name)
+                        _save_tiles_not_on_s3()
+                    logger.debug("WorldCover tile not on S3 (ocean/uncovered): %s", tile_name)
+                    return None
                 if r.status_code != 200:
                     raise RuntimeError(
                         f"WorldCover download failed (HTTP {r.status_code}): {tile_name}"
@@ -424,7 +458,11 @@ def ensure_worldcover_tile(
                 elapsed,
                 downloaded,
             )
+            _TILES_KNOWN_LOCAL.add(tile_name)
             return tile_path
+        except RuntimeError:
+            tmp_path.unlink(missing_ok=True)
+            raise
         except Exception as exc:
             tmp_path.unlink(missing_ok=True)
             raise RuntimeError(f"Failed to download {tile_name}: {exc}") from exc
@@ -456,28 +494,32 @@ def fetch_worldcover_class(
 
     if worldcover_dir is None:
         worldcover_dir = WORLDCOVER_DIR
-        worldcover_dir.mkdir(parents=True, exist_ok=True)
 
     tile_name = get_tile_name(lat, lon)
     tile_path = worldcover_dir / tile_name
 
-    if not tile_path.exists():
-        if not download_if_missing:
+    if tile_name not in _TILES_KNOWN_LOCAL:
+        if tile_name in _TILES_NOT_ON_S3:
             return None
-        try:
-            result = ensure_worldcover_tile(lat, lon, worldcover_dir)
-        except Exception as exc:
-            logger.warning(
-                "WorldCover tile download failed for (%.4f, %.4f): %s — using fallback",
-                lat,
-                lon,
-                exc,
-            )
+        if tile_path.exists():
+            _TILES_KNOWN_LOCAL.add(tile_name)
+        elif download_if_missing:
+            try:
+                result = ensure_worldcover_tile(lat, lon, worldcover_dir)
+            except Exception as exc:
+                logger.warning(
+                    "WorldCover tile download failed for (%.4f, %.4f): %s — using fallback",
+                    lat,
+                    lon,
+                    exc,
+                )
+                return None
+            if result is None:
+                return None
+            tile_path = result
+            _TILES_KNOWN_LOCAL.add(tile_name)
+        else:
             return None
-        if result is None:
-            # Tile skipped (outside active bbox)
-            return None
-        tile_path = result
 
     try:
         # Use context manager for thread-safe tile access with reference counting
@@ -497,7 +539,6 @@ def clutter_loss_db(
     lon: float,
     point_num: int = 0,
     worldcover_dir: Path | None = None,
-    verbose: bool = True,
     loss_table: dict[int, float] | None = None,
     fallback_db: float | None = None,
 ) -> float:
@@ -512,26 +553,28 @@ def clutter_loss_db(
         lon: Longitude in degrees
         point_num: Point number for progress reporting (logs every 50 points)
         worldcover_dir: Directory containing WorldCover tiles (defaults to WORLDCOVER_DIR)
-        verbose: If True, print progress messages
         loss_table: Custom clutter loss values per class ID (None = use defaults)
         fallback_db: Custom fallback loss for unknown classes (None = use default)
 
     Returns:
         Clutter loss in dB
     """
-    key = (int(round(lat * 1000)), int(round(lon * 1000)))
-
-    with _CLUTTER_CACHE_LOCK:
-        if key in _CLUTTER_CACHE:
-            _CLUTTER_CACHE.move_to_end(key)  # mark as recently used
-            return _CLUTTER_CACHE[key]
-
+    use_default_table = loss_table is None and fallback_db is None
     table = loss_table if loss_table is not None else CLUTTER_LOSS_DB
     fb = fallback_db if fallback_db is not None else CLUTTER_FALLBACK_DB
 
+    key = (int(round(lat * 1000)), int(round(lon * 1000)))
+
+    # Only use the cache when the default table is active. Custom loss_table
+    # values differ per-run and must not bleed into runs using different tables.
+    if use_default_table:
+        with _CLUTTER_CACHE_LOCK:
+            if key in _CLUTTER_CACHE:
+                _CLUTTER_CACHE.move_to_end(key)
+                return _CLUTTER_CACHE[key]
+
     if worldcover_dir is None:
         worldcover_dir = WORLDCOVER_DIR
-        worldcover_dir.mkdir(parents=True, exist_ok=True)
 
     cl = fetch_worldcover_class(lat, lon, worldcover_dir)
     if cl is None:
@@ -539,19 +582,104 @@ def clutter_loss_db(
         # but do NOT cache it so a later successful download gives the real value.
         return fb
 
-    if verbose and (point_num == 0 or point_num % 50 == 0):
-        print(f"[Clutter] WorldCover class at lat={lat:.2f}, lon={lon:.2f} is {cl}")
     val = table.get(cl, fb)
 
-    with _CLUTTER_CACHE_LOCK:
-        _CLUTTER_CACHE[key] = val
-        _CLUTTER_CACHE.move_to_end(key)
-        # Inline eviction: if we just crossed the max, trim to min immediately
-        if len(_CLUTTER_CACHE) > _CACHE_MAX_SIZE:
-            while len(_CLUTTER_CACHE) > _CACHE_MIN_SIZE:
-                _CLUTTER_CACHE.popitem(last=False)
+    if use_default_table:
+        with _CLUTTER_CACHE_LOCK:
+            _CLUTTER_CACHE[key] = val
+            _CLUTTER_CACHE.move_to_end(key)
+            if len(_CLUTTER_CACHE) > _CACHE_MAX_SIZE:
+                while len(_CLUTTER_CACHE) > _CACHE_MIN_SIZE:
+                    _CLUTTER_CACHE.popitem(last=False)
 
     return val
+
+
+def prefetch_tiles_for_bbox(
+    bbox: tuple[float, float, float, float],
+    worldcover_dir: Path,
+    num_workers: int = 8,
+) -> None:
+    """Download all WorldCover tiles overlapping bbox in parallel.
+
+    Enumerate every 3°×3° tile that intersects the bounding box and download
+    any that are not already present on disk. Uses a thread pool so multiple
+    tiles are fetched concurrently. Per-tile locks in ensure_worldcover_tile
+    prevent duplicate downloads if called from multiple threads simultaneously.
+
+    Args:
+        bbox: (min_lon, min_lat, max_lon, max_lat)
+        worldcover_dir: Local directory for storing tiles
+        num_workers: Number of concurrent download threads
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    min_lon, min_lat, max_lon, max_lat = bbox
+
+    # Enumerate 3°×3° tile origins that overlap the bbox
+    tile_points: list[tuple[float, float]] = []
+    lat = int(math.floor(min_lat / 3.0) * 3)
+    while lat <= max_lat:
+        lon = int(math.floor(min_lon / 3.0) * 3)
+        while lon <= max_lon:
+            # Pass a point inside the tile; ensure_worldcover_tile derives the
+            # tile name from floor(lat/3)*3 and floor(lon/3)*3 internally.
+            tile_points.append((lat + 1.5, lon + 1.5))
+            lon += 3
+        lat += 3
+
+    if not tile_points:
+        return
+
+    # Round bbox to 3° grid to make cache key stable across equivalent bboxes
+    bbox_key = (
+        math.floor(bbox[0] / 3) * 3,
+        math.floor(bbox[1] / 3) * 3,
+        math.ceil(bbox[2] / 3) * 3,
+        math.ceil(bbox[3] / 3) * 3,
+    )
+    with _PREFETCHED_BBOXES_LOCK:
+        if bbox_key in _PREFETCHED_BBOXES:
+            return
+        _PREFETCHED_BBOXES.add(bbox_key)
+
+    already_local = sum(
+        1 for tlat, tlon in tile_points
+        if (worldcover_dir / get_tile_name(tlat, tlon)).exists()
+           or get_tile_name(tlat, tlon) in _TILES_NOT_ON_S3
+    )
+    to_download = len(tile_points) - already_local
+
+    logger.info(
+        "WorldCover prefetch: %d tiles in bbox, %d already cached, %d to download "
+        "(%d workers)",
+        len(tile_points),
+        already_local,
+        to_download,
+        num_workers,
+    )
+
+    if to_download == 0:
+        return
+
+    with ThreadPoolExecutor(
+        max_workers=num_workers, thread_name_prefix="wc-prefetch"
+    ) as pool:
+        futures = {
+            pool.submit(ensure_worldcover_tile, tlat, tlon, worldcover_dir): (tlat, tlon)
+            for tlat, tlon in tile_points
+        }
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                tlat, tlon = futures[future]
+                logger.warning(
+                    "WorldCover tile prefetch failed at (%.1f, %.1f): %s",
+                    tlat,
+                    tlon,
+                    exc,
+                )
 
 
 def load_country_boundary(
